@@ -7,23 +7,51 @@ use rocket::http::ContentType;
 use rocket::request::FlashMessage;
 use rocket::response::content::Content;
 use rocket::response::{Flash, Redirect};
+use std::fmt::Display;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 
-fn path_for_blog(name: &str) -> std::path::PathBuf {
+fn path_for_blog(name: &str) -> PathBuf {
     let mut path = "state/blogs/".to_string();
-    base64::encode_config_buf(
-        name,
-        base64::Config::new(base64::CharacterSet::UrlSafe, false),
-        &mut path,
-    );
+    base64::encode_config_buf(name, base64::Config::new(base64::CharacterSet::UrlSafe, false), &mut path);
     dbg!(path.into())
 }
 
+fn name_from_path<A: AsRef<Path>>(path: A) -> String {
+    let encoded = path
+        .as_ref()
+        .file_name()
+        .expect("name_from_path called with invalid blog path")
+        .to_str()
+        .expect("base64 encoded blog name isn't valid utf8");
+    String::from_utf8(base64::decode_config(encoded, base64::Config::new(base64::CharacterSet::UrlSafe, false)).expect("blog name isn't valid base64")).expect("blog name isn't valid utf8")
+}
+
 #[derive(FromForm)]
-struct BlogSubmission {
+struct BlogMeta {
     name: String,
     description: Option<String>,
+}
+
+impl Display for BlogMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "{}: {}", &self.name, self.description.as_ref().unwrap_or(&"".to_string()))
+    }
+}
+
+struct BlogList {
+    blogs: Vec<BlogMeta>,
+}
+
+impl Display for BlogList {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "<ul>")?;
+        for meta in &self.blogs {
+            write!(f, "<li><a href=\"{}\">{}</a></li>", uri!(blog_home: &meta.name), meta)?;
+        }
+        write!(f, "</ul>")
+    }
 }
 
 #[get("/")]
@@ -45,7 +73,7 @@ fn new_blog_form(flash: Option<FlashMessage>) -> Content<String> {
 
 #[post("/newblog", data = "<submission>")]
 fn new_blog_accept(
-    submission: rocket::request::Form<BlogSubmission>,
+    submission: rocket::request::Form<BlogMeta>,
 ) -> Result<Redirect, Flash<Redirect>> {
     // create the folder for the blog data
     let blog_path = path_for_blog(&submission.name);
@@ -112,7 +140,7 @@ fn blog_home(name: String) -> Option<Content<String>> {
         Ok(dir) => dir,
         Err(ref e) if e.kind() == ErrorKind::NotFound => return None,
         Err(e) => panic!(
-            "unable to iterator over posts dir for blog: {:?} for reason: {:?}",
+            "unable to iterate over posts dir for blog: {:?} for reason: {:?}",
             name, e
         ),
     };
@@ -136,11 +164,39 @@ fn blog_home(name: String) -> Option<Content<String>> {
     ))
 }
 
+#[get("/blogs")]
+fn blogs() -> Content<String> {
+    let dir = std::fs::read_dir("state/blogs").expect("unable to iterate over blogs dir");
+    let mut bloglist = Vec::new();
+    for entry in dir {
+        //fixme
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = name_from_path(&path);
+        let description = match File::open(path.join("description.txt")) {
+            Ok(mut file) => {
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)
+                    .expect("unable to *read* from description file");
+                Some(buf)
+            }
+            Err(ref e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => panic!(
+                "unable to open description for blog: {:?} for reason: {:?}",
+                name, e
+            ),
+        };
+        let meta = BlogMeta { name, description };
+        bloglist.push(meta);
+    }
+    Content(ContentType::HTML, format!(include!("blogs.html"), BlogList { blogs: bloglist } ))
+}
+
 fn main() {
     rocket::ignite()
         .mount(
             "/",
-            routes![index, new_blog_form, new_blog_accept, blog_home],
+            routes![index, new_blog_form, new_blog_accept, blog_home, blogs],
         )
         .launch();
 }
