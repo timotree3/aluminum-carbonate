@@ -12,6 +12,31 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
+enum DirError {
+    AlreadyExists,
+    DeletedDuring,
+    CreationFailure(std::io::Error),
+    ClosureFailure(std::io::Error),
+}
+
+fn create_dir_with<A, F, T>(path: A, code: F) -> Result<T, DirError>
+where
+    A: AsRef<Path>,
+    F: FnOnce() -> Result<T, std::io::Error>,
+{
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(ref e) if e.kind() == ErrorKind::AlreadyExists => return Err(DirError::AlreadyExists),
+        Err(e) => return Err(DirError::CreationFailure(e)),
+    }
+    match code() {
+        Ok(v) => Ok(v),
+        Err(ref e) if e.kind() == ErrorKind::NotFound => Err(DirError::DeletedDuring),
+        Err(e) => Err(DirError::ClosureFailure(e)),
+    }
+}
+
 fn base64_config() -> base64::Config {
     base64::Config::new(base64::CharacterSet::UrlSafe, false)
 }
@@ -94,59 +119,28 @@ fn new_blog_accept(
 ) -> Result<Redirect, Flash<Redirect>> {
     // create the folder for the blog data
     let blog_path = path_for_blog(&submission.name);
-    match std::fs::create_dir(&blog_path) {
-        Ok(()) => {}
-        Err(ref e) if e.kind() == ErrorKind::AlreadyExists => {
+    let result = create_dir_with(&blog_path, || {
+        std::fs::create_dir(blog_path.join("posts"))?;
+        if let Some(desc) = &submission.description {
+            let mut file = File::create(blog_path.join("description.txt"))?;
+            file.write_all(desc.as_bytes())?;
+        }
+        Ok(Redirect::to(uri!(blog_home: &submission.name)))
+    });
+    result.map_err(|e| match e {
+        DirError::AlreadyExists => {
             // name taken
-            // return Err()...
-            return Err(Flash::error(
-                Redirect::to(uri!(new_blog_form)),
-                "name taken",
-            ));
+            Flash::error(Redirect::to(uri!(new_blog_form)), "name taken")
         }
-        Err(e) => panic!("unable to create blog dir for reason: {:?}", e),
-    }
-    // create the empty folder for the posts
-    match std::fs::create_dir(blog_path.join("posts")) {
-        Ok(()) => {}
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
+        DirError::DeletedDuring => {
             // error to user with internal error occured, try again in a few seconds
-            return Err(Flash::warning(
+            Flash::warning(
                 Redirect::to(uri!(new_blog_form)),
                 "internal error occured, try again in a few seconds",
-            ));
+            )
         }
-        Err(e) => panic!("unable to create posts folder for reason: {:?}", e),
-    }
-
-    let desc = if let Some(desc) = &submission.description {
-        desc
-    } else {
-        return Ok(Redirect::to(uri!(index)));
-    };
-    let mut file = match File::create(blog_path.join("description.txt")) {
-        Ok(f) => f,
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
-            // error to user with internal error occured, try again in a few seconds
-            return Err(Flash::warning(
-                Redirect::to(uri!(new_blog_form)),
-                "internal error occured, try again in a few seconds",
-            ));
-        }
-        Err(e) => panic!("unable to create description file for reason: {:?}", e),
-    };
-    match file.write_all(desc.as_bytes()) {
-        Ok(()) => {}
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // internal error try again
-            return Err(Flash::warning(
-                Redirect::to(uri!(new_blog_form)),
-                "internal error occured, try again in a few seconds",
-            ));
-        }
-        Err(e) => panic!("unable to write to description file for reason: {:?}", e),
-    }
-    Ok(Redirect::to(uri!(blog_home: &submission.name)))
+        e => panic!("unable to create new blog for reason: {:?}", e),
+    })
 }
 
 #[get("/blogs/<name>")]
@@ -228,9 +222,9 @@ fn create_post(name: String) -> Option<Content<&'static str>> {
     }
 }
 
-fn path_for_post(name: &str, title: &str) -> PathBuf {
+fn post_suffix(title: &str) -> PathBuf {
     let b64_encoded = base64::encode_config(title, base64_config());
-    path_for_blog(name).join("posts").join(b64_encoded)
+    Path::new("posts").join(b64_encoded)
 }
 
 #[post("/blogs/<name>/create", data = "<submission>")]
@@ -239,59 +233,59 @@ fn new_post_accept(
     submission: rocket::request::Form<DraftData>,
 ) -> Result<Redirect, Flash<Redirect>> {
     // create new folder with base64 encoded title
-    let post_path = path_for_post(&name, &submission.title);
-    match std::fs::create_dir(&post_path) {
-        Ok(()) => {}
-        Err(e) => match e.kind() {
-            ErrorKind::AlreadyExists => {
-                return Err(Flash::warning(
-                    Redirect::to(uri!(create_post: name)),
-                    "a post with that title already exists",
-                ))
-            }
-            ErrorKind::NotFound => {
-                return Err(Flash::error(
-                    Redirect::to(uri!(blogs)),
-                    "that blog doesn't exist or has been deleted",
-                ))
-            }
-            _ => panic!(
-                "failed to create dir for post. blog: {:?}, post_title: {:?}, error: {:?}",
-                name, submission.title, e
-            ),
-        },
-    }
-    // create file in folder called body.txt
-    let mut f = match File::create(post_path.join("body.txt")) {
-        Ok(f) => f,
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
-            return Err(Flash::error(
-                Redirect::to(uri!(blogs)),
-                "that blog has since been deleted",
-            ))
-        }
-        Err(e) => panic!(
-            "failed to create body.txt for post. blog: {:?}, post_title: {:?}, error: {:?}",
+    let post_path = path_for_blog(&name).join(post_suffix(&submission.title));
+    create_dir_with(&post_path, || {
+        // create file in folder called body.txt
+        let mut f = File::create(post_path.join("body.txt"))?;
+        // write content into body.txt
+        f.write_all(submission.body.as_bytes())?;
+        // return redirect to post link
+        Ok(Redirect::to(uri!(index)))
+    })
+    .map_err(|e| match e {
+        DirError::AlreadyExists => Flash::warning(
+            Redirect::to(uri!(create_post: name)),
+            "a post with that title already exists",
+        ),
+        DirError::DeletedDuring => Flash::error(
+            Redirect::to(uri!(blogs)),
+            "that blog or post has since been deleted",
+        ),
+        DirError::CreationFailure(ref e) if e.kind() == ErrorKind::NotFound => Flash::error(
+            Redirect::to(uri!(blogs)),
+            "that blog doesn't exist or has been deleted",
+        ),
+        e => panic!(
+            "failed to create files for post. blog: {:?}, post_title: {:?}, error: {:?}",
             name, submission.title, e
         ),
-    };
-    // write content into body.txt
-    match f.write_all(submission.body.as_bytes()) {
-        Ok(()) => {}
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
-            return Err(Flash::error(
-                Redirect::to(uri!(blogs)),
-                "that blog has since been deleted",
-            ))
+    })
+}
+
+#[get("/blogs/<name>/p/<title>")]
+fn post(name: String, title: String) -> Option<Content<String>> {
+    let blog_path = path_for_blog(name: &str);
+    let result = || -> Result<(String, String), io::Error> {
+        let f = File::open(blog_path.join(post_suffix(&title).join("body.txt")))?;
+        let mut body = String::new();
+        f.read_to_string(&mut body)?;
+        f = File::open(blog_path.join("description.txt"))?;
+        let mut description = String::new();
+        f.read_to_string(&mut description)?;
+        Ok((description, body))
+    }()
+    match result {
+        
+        Err(ref e) if e.kind() = ErrorKind::NotFound => {
+            return None();
         }
-        Err(e) => panic!(
-            "failed to write to body.txt for post. blog: {:?}, post_title: {:?}, error: {:?}",
-            name, submission.title, e
-        ),
+        Err(e) {
+            panic!("unexpected error when displaying post: {:?}", e);
+        }
     }
-    // return redirect to post link
-    // Ok(Redirect::to(uri!(view_post(name, title))))
-    Ok(Redirect::to(uri!(index)))
+
+
+    Ok(Content(ContentType::HTML, format!(include!("post.html"), name, description, title, body)))
 }
 
 fn main() {
